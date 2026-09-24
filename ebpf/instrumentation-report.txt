@@ -1,0 +1,50 @@
+﻿ContosoPizza instrumentation report
+generated 2026-09-17 13:44:38
+========================================================================
+
+--- driving traffic ---
+
+
+========================================================================
+LAYER 1 - eBPF (kernel): TCP connections
+========================================================================
+program loaded : 13     1      1  JIT        sockops        contoso_connection_monitor
+
+LOCAL             REMOTE            CLIENTPORT DIR  PID    STATE   DURATION_MS
+------------------------------------------------------------------------------
+127.0.0.1:5176    127.0.0.1:51129   51129      in   3616   OPEN    -
+127.0.0.1:51129   127.0.0.1:5176               out  15624  OPEN    -
+127.0.0.1:5176    127.0.0.1:51125   51125      in   3616   CLOSED  4781.4
+127.0.0.1:51125   127.0.0.1:5176               out  16096  CLOSED  4781.3
+
+connections established   : 2
+connections closed        : 1
+total open-time (ns)      : 4781420100
+currently open            : 1
+
+process attribution:
+  pid 3616   ContosoPizza
+  pid 15624  powershell
+  pid 16096  (exited)
+
+========================================================================
+LAYER 2 - OpenTelemetry (app): HTTP requests
+========================================================================
+
+requests captured this run: 20
+
+ROUTE                    STATUS   COUNT   MIN_MS    MAX_MS    MEAN_MS
+----------------------------------------------------------------------
+WeatherForecast          200      20      0.142     0.445     0.202
+
+connections used by these requests (client.port -> request count):
+  port 51129    20 requests
+
+========================================================================
+THE JOIN - same connections, both layers
+========================================================================
+
+CLIENTPORT   HTTP_REQUESTS  CONN_OPEN_MS     INTERPRETATION
+--------------------------------------------------------------------------
+51125        0              4781.4           connection with no completed request
+51129        20             still open       20 requests reused 1 socket (keep-alive)

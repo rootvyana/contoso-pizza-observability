@@ -1,0 +1,415 @@
+================================================================================
+ ONBOARDING AN APPLICATION TO LOVEHEARTBEAT VIA THE ON-PREM COLLECTOR
+================================================================================
+
+ Written for any application on any machine, not just ContosoPizza. Nothing
+ below is specific to .NET except where it says so.
+
+ Last verified: 21 September 2026, against app.loveheartbeat.com with a real
+ collector, a real OpenTelemetry SDK exporter and real delivered telemetry.
+
+
+--------------------------------------------------------------------------------
+ 0. THE SHAPE OF IT
+--------------------------------------------------------------------------------
+
+   YOUR NETWORK                                        LOVEHEARTBEAT
+  +---------------------------------------+
+  | app-01   your app --- OTLP ---+       |
+  |          probe (optional) ----+       |
+  |                                \      |
+  | app-02   your app --- OTLP -----+---> COLLECTOR ===== HTTPS 443 =====> API
+  |          probe (optional) ------+      one per site    outbound only
+  |                                /                       one credential
+  | db-01    probe (optional) ----+       |
+  +---------------------------------------+
+
+ Three pieces. You may only need two.
+
+   COLLECTOR   One per site. Holds the only credential. Spools to disk so a
+               cloud outage loses nothing. No elevation. Listens on the LAN
+               only -- never expose it to the internet.
+
+   YOUR APP    No agent, no code change. You point its existing OpenTelemetry
+               exporter at the collector instead of wherever it points now.
+
+   PROBE       OPTIONAL. One per server, ONLY if you want kernel-level network
+               connection data. Windows-only, needs administrator rights.
+               Skip it entirely if you just want application telemetry.
+
+ Why a collector rather than an agent per server: an agent per server needs a
+ credential per server -- fifty machines is fifty secrets to rotate. And
+ nothing can then answer "is this fleet reporting?", because each agent only
+ speaks for itself and the one that died yesterday is invisible precisely
+ because it died.
+
+
+--------------------------------------------------------------------------------
+ 1. WHAT YOU NEED BEFORE STARTING
+--------------------------------------------------------------------------------
+
+ [ ] A machine for the collector. Any always-on box on the same network as the
+     applications. It needs outbound HTTPS. It does NOT need to be a server,
+     and it does NOT need administrator rights.
+
+ [ ] A loveheartbeat login for the organization the data should belong to.
+     This matters: the collector is filed under whichever org creates it, and
+     you will only see its data signed in as that org.
+
+ [ ] .NET 10 runtime on the collector machine.
+
+ [ ] The env selector for your deployment. See step 2c -- easy to miss and
+     nothing works without it.
+
+
+--------------------------------------------------------------------------------
+ 2. SET UP THE COLLECTOR  (once per site)
+--------------------------------------------------------------------------------
+
+ 2a. CREATE IT IN THE DASHBOARD
+ ------------------------------
+ Platform -> Integrations -> On-prem collectors -> "Add collector"
+
+ Give it a name and optionally a site. You get back three things:
+
+     Collector id        col_xxxxxxxxxxxx
+     Enrollment token    single use, expires in 24 hours
+     Probe key           generated for you; it is yours to keep or replace
+
+ COPY ALL THREE NOW. The enrollment token is shown exactly once and no route
+ reads it back. Lose it and you register a new collector.
+
+ No dashboard yet? Same thing over HTTP:
+
+     curl -X POST https://<api-host>/api/v1/collectors \
+       -H "X-API-Key: <your key>" -H "Content-Type: application/json" \
+       -d '{"name":"HQ collector","site":"london-dc1","env":"<env selector>"}'
+
+
+ 2b. WORK OUT YOUR API HOST
+ --------------------------
+ Not the address you browse to. Open your loveheartbeat site and fetch:
+
+     https://<your-site>/assets/js/runtime-config.js
+
+ It prints exactly what you need:
+
+     window.__API_BASE_URL__ = 'https://app.loveheartbeat.com';
+     window.__ENV_TOKEN__    = 'f21ece62...';
+
+
+ 2c. THE ENV SELECTOR  (read this, it is the most common failure)
+ ----------------------------------------------------------------
+ One hostname can front several isolated backends -- dev, qa, prod -- with a
+ router choosing between them by an opaque token. If your deployment does this,
+ every call without the token is refused:
+
+     {"detail": "The env selector is required in the JSON payload"}
+
+ which reads like a broken collector and is not one. Take __ENV_TOKEN__ from
+ runtime-config.js above.
+
+ If runtime-config.js has no __ENV_TOKEN__, or you talk to a backend directly,
+ leave it unset.
+
+ It is not a credential -- the backend still authenticates every request -- but
+ it is deployment-specific, so it is configuration.
+
+
+ 2d. START THE COLLECTOR
+ -----------------------
+ Windows PowerShell, no elevation:
+
+     cd <path>\agent\ContosoPizza.Collector
+
+     $env:Cloud__Endpoint                       = "https://app.loveheartbeat.com"
+     $env:CONTOSO_COLLECTOR_ENV_TOKEN           = "<env selector, if any>"
+     $env:CONTOSO_COLLECTOR_ENROLLMENT_TOKEN    = "<one-time token>"
+     $env:CONTOSO_PROBE_KEY                     = "<probe key>"
+
+     dotnet run
+
+ Wait for:
+
+     Enrolled as collector col_xxxx. The credential is stored and does not expire.
+
+ That line is the whole point. From here the collector holds a durable
+ credential, DPAPI-encrypted on its own disk. You never need the enrollment
+ token again, and there is nothing to renew. Only an explicit Revoke in the
+ dashboard ends it.
+
+ The collector now listens on port 5200 for your applications.
+
+
+ 2e. VERIFY BEFORE GOING FURTHER
+ -------------------------------
+     dotnet run -- --diagnose
+
+ Expect "All checks passed". If not, stop here -- nothing downstream will work.
+ See troubleshooting at the bottom.
+
+
+--------------------------------------------------------------------------------
+ 3. POINT YOUR APPLICATION AT IT
+--------------------------------------------------------------------------------
+
+ NO CODE CHANGE. Three standard OpenTelemetry environment variables, the same
+ in every language:
+
+     OTEL_EXPORTER_OTLP_ENDPOINT=http://<collector-host>:5200
+     OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+     OTEL_EXPORTER_OTLP_HEADERS=X-Probe-Key=<probe key>
+
+ Both OTLP encodings are accepted -- protobuf (every SDK's default) and JSON --
+ decided by Content-Type. There is no line to change for that.
+
+ Already running an OpenTelemetry Collector? Point its exporter at the same URL:
+
+     exporters:
+       otlphttp:
+         endpoint: http://<collector-host>:5200
+         headers:
+           X-Probe-Key: <probe key>
+     service:
+       pipelines:
+         traces: { exporters: [otlphttp] }
+         logs:   { exporters: [otlphttp] }
+
+ Not instrumented yet? Install the OTel SDK for your language first -- that is
+ the same work whatever you send it to, and is outside this document.
+
+
+ 3a. TWO THINGS THAT DECIDE WHETHER YOUR DATA IS USEFUL
+ -------------------------------------------------------
+
+   service.name
+     Set it on the resource. Every page groups by it. An app that does not set
+     one shows as "unknown_service".
+
+   http.route
+     Must be the route TEMPLATE -- /api/orders/{id} -- not the concrete path.
+     Without it every request becomes its own single-hit "route" and the API
+     Monitoring page is a list of ids.
+
+     Most server frameworks set this automatically for MATCHED routes. A 404
+     has no route template, so 404s legitimately do not appear there.
+
+
+--------------------------------------------------------------------------------
+ 4. THE PROBE  (optional -- kernel network data)
+--------------------------------------------------------------------------------
+
+ SKIP THIS unless you specifically want per-connection network flows. Nothing
+ in section 3 depends on it.
+
+ Windows only. Requires administrator rights, because reading eBPF maps needs
+ the same rights bpftool does.
+
+ On each monitored server, once:
+
+     cd <path>\ebpf
+     .\load.ps1            # as administrator; does NOT survive a reboot
+
+ Then, as administrator:
+
+     cd <path>\agent\ContosoPizza.Probe
+     $env:CONTOSO_PROBE_KEY          = "<the same probe key>"
+     $env:Probe__CollectorEndpoint   = "http://<collector-host>:5200"
+     dotnet run
+
+ Check it without elevation:
+
+     dotnet run -- --check
+
+ The probe holds no credential and writes nothing to disk. If it cannot reach
+ the collector it buffers in memory and then drops -- durability is the
+ collector's job, in one place, with one disk quota.
+
+
+--------------------------------------------------------------------------------
+ 5. CHECK IT WORKED
+--------------------------------------------------------------------------------
+
+ On the collector machine:
+
+     curl http://localhost:5200/status
+
+ What to look at:
+
+     cloud_authenticated      must be true
+     spans_received           climbing = your app is reaching the collector
+     records_delivered        climbing = the collector is reaching the cloud
+     delivery_failures        should stay 0
+     spool_segments_pending   should return to 0 between flushes
+     servers                  one entry per reporting machine
+
+ In the dashboard:
+
+     On-prem collectors    your collector, health "Healthy", server count
+     API Monitoring        one row per http.route, with latency and errors
+     Traces                individual requests, with a span waterfall
+     Logs                  application logs, and kernel flows if probes run
+
+ Drive some traffic through your app first -- an idle app produces nothing, and
+ an empty page is the honest answer to that.
+
+
+--------------------------------------------------------------------------------
+ 6. RUN IT PERMANENTLY
+--------------------------------------------------------------------------------
+
+ Both binaries support running as Windows services.
+
+     sc.exe create ContosoCollector binPath= "<path>\ContosoPizza.Collector.exe" start= auto
+     sc.exe description ContosoCollector "On-prem telemetry collector"
+     sc.exe start ContosoCollector
+
+     sc.exe create ContosoProbe binPath= "<path>\ContosoPizza.Probe.exe" start= auto
+
+ The probe must run as an account with administrator rights. The collector must
+ not -- give it the least privilege that works.
+
+ Put the settings in appsettings.json rather than environment variables when
+ running as a service, EXCEPT the secrets. Keep those in the environment or in
+ the service's own configuration; config files get committed by accident.
+
+ The collector's state directory holds the credential. Back it up or accept
+ that a rebuild means re-enrolling. Default:
+
+     C:\ProgramData\ContosoCollector
+
+
+--------------------------------------------------------------------------------
+ 7. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+ "The env selector is required in the JSON payload"
+     Section 2c. You have not set CONTOSO_COLLECTOR_ENV_TOKEN, or it is wrong.
+     Take it from the site's /assets/js/runtime-config.js.
+
+ "Invalid or already-used enrollment token"
+     Single use, 24 hours. If a previous attempt succeeded, the token is spent
+     and the collector already has its credential -- start it WITHOUT the
+     token. Otherwise issue a new one from the dashboard.
+
+ 401 on every request after changing Cloud__Endpoint
+     The stored credential belongs to the backend that issued it. Pointing an
+     enrolled collector at a different backend fails forever, silently. Delete
+     the credential and enroll again:
+
+         Remove-Item "$env:ProgramData\ContosoCollector\collector-credential.dat"
+
+ "The stored credential could not be decrypted on this machine"
+     The state directory was copied from another machine. DPAPI is bound to the
+     machine. Delete it and re-enroll.
+
+ Probe or app gets 401 from the collector
+     X-Probe-Key does not match the collector's. It must be identical on the
+     collector, every probe, and every application's OTLP headers.
+
+ Collector says healthy, but nothing appears in the dashboard
+     Almost always the tenant. The collector's data belongs to the org that
+     CREATED it. Sign in as that org. /status names the collector id -- check
+     it against the collectors page.
+
+ API Monitoring shows a route, Traces shows nothing
+     Fixed in the backend (commit 80c32fb) but needs a backend deploy. Both
+     pages read the same spans; the read used to take the oldest ones once a
+     tenant had stored more than about a thousand.
+
+ Spool keeps growing, delivery_failures climbing
+     The collector cannot reach the cloud. Nothing is lost -- it retries
+     forever and drains on recovery -- but run --diagnose to find out why.
+     Past MaxSpoolBytes (256 MB) the oldest segments are dropped and the loss
+     is reported as segments_dropped rather than hidden.
+
+ A quiet page with no error
+     An empty page is the honest answer for a tenant with no data. Check
+     records_delivered on the collector before suspecting the dashboard.
+
+
+--------------------------------------------------------------------------------
+ 8. KNOWN LIMITS  (so they are not surprises)
+--------------------------------------------------------------------------------
+
+ METRICS ARE NOT FORWARDED
+     OTLP metric points are accepted, counted and dropped. The cloud intake
+     takes logs, spans and flows. The count is reported on every heartbeat as
+     otlp_metrics_dropped rather than vanishing quietly.
+
+     Latency and error rate still work -- they are derived from spans, which is
+     how most APM products do it anyway. What is missing is process-level
+     metrics: CPU, memory, GC, custom counters.
+
+ THE PROBE POLLS
+     A connection that opens and closes entirely between two scrapes is missed.
+     The default interval is 2s, settable from the dashboard.
+
+ THE eBPF PROGRAM DOES NOT SURVIVE A REBOOT
+     Re-run load.ps1, or install it as a startup task.
+
+ ONE COLLECTOR PER SITE, NO FAILOVER PAIR
+     If the collector is down, probes buffer in memory and then drop.
+     Applications' own SDK exporters buffer and then drop too. The spool
+     protects against the cloud being unreachable, not against the collector
+     itself being down.
+
+ THE LAN HOP IS A SHARED KEY OVER PLAIN HTTP
+     Fine inside a trusted network, which is the assumption throughout. Put an
+     https:// URL in CollectorEndpoint if your network is not that.
+
+
+--------------------------------------------------------------------------------
+ 9. SECURITY SUMMARY
+--------------------------------------------------------------------------------
+
+ Outbound only. The collector opens connections to the cloud; the cloud never
+ opens one to it. No inbound port from the internet, no firewall change, no
+ port forwarding, no tunnel.
+
+ Secrets, and how long each lives:
+
+   Enrollment token    single use, 24 hours     pasted in once, ever
+   Collector credential  never expires          DPAPI-encrypted on disk
+   Session             12h, slides, auto-renews memory only
+   Probe key           yours to rotate          shared across your own network
+
+ Neither the credential nor the session is stored server-side in a replayable
+ form -- the lookup key is a SHA-256, so a dump of the table yields nothing
+ that can be presented back.
+
+ Revoking a collector takes effect on its NEXT request, not whenever its
+ session happens to lapse. The credential cannot be reissued: recovery is a new
+ collector and another visit to the machine.
+
+ What is collected: route templates, methods, status codes, durations, and --
+ if probes run -- connection four-tuples and process names. No request bodies,
+ no response bodies, no headers.
+
+
+--------------------------------------------------------------------------------
+ QUICK REFERENCE
+--------------------------------------------------------------------------------
+
+ Collector
+   Cloud__Endpoint                       https://app.loveheartbeat.com
+   CONTOSO_COLLECTOR_ENV_TOKEN           from runtime-config.js
+   CONTOSO_COLLECTOR_ENROLLMENT_TOKEN    first run only
+   CONTOSO_PROBE_KEY                     shared with probes and apps
+   Cloud__StateDirectory                 default C:\ProgramData\ContosoCollector
+   listens on                            0.0.0.0:5200
+   check                                 dotnet run -- --diagnose
+   local status                          GET http://localhost:5200/status
+
+ Application
+   OTEL_EXPORTER_OTLP_ENDPOINT           http://<collector>:5200
+   OTEL_EXPORTER_OTLP_PROTOCOL           http/protobuf
+   OTEL_EXPORTER_OTLP_HEADERS            X-Probe-Key=<probe key>
+
+ Probe (optional, admin)
+   CONTOSO_PROBE_KEY                     same key
+   Probe__CollectorEndpoint              http://<collector>:5200
+   check                                 dotnet run -- --check
+   read the maps                         dotnet run -- --dump
+
+================================================================================

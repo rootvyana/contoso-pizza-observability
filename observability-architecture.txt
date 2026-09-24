@@ -1,0 +1,491 @@
+ContosoPizza observability architecture
+collector agent design -- research, gap analysis and proposal
+written 2026-09-17
+========================================================================
+
+CONTENTS
+
+  1. The problem
+  2. How Datadog does it
+  3. How Dynatrace does it
+  4. How the OpenTelemetry Collector does it
+  5. Gap analysis: what we have today
+  6. Two defects found in the current eBPF program
+  7. Proposed architecture
+  8. The six changes that carry the weight
+  9. Open questions
+ 10. Sources
+
+
+========================================================================
+1. THE PROBLEM
+========================================================================
+
+We have two working instrumentation layers and no way to get them
+anywhere useful.
+
+  Layer 1  eBPF sockops program in the kernel -> flow_map, stats_map
+  Layer 2  OpenTelemetry inside ContosoPizza -> traces and metrics
+
+Layer 1 is read by running bpftool from PowerShell and decoding the raw
+bytes by hand. Layer 2 is written to stdout by the console exporter and
+captured to app.log, which is now 4.8 MB of text. Correlating them means
+running collect-logs.ps1 and reading the resulting .txt by eye.
+
+That is enough to prove the instrumentation works. It is not a pipeline.
+What follows is how the two dominant commercial agents solve the same
+problem, and what we should take from each.
+
+
+========================================================================
+2. HOW DATADOG DOES IT
+========================================================================
+
+A fleet of single-purpose processes sharing one forwarding path.
+
+  PROCESS          PRIVILEGE      RESPONSIBILITY
+  ---------------------------------------------------------------------
+  system-probe     privileged     Owns the kernel. Loads eBPF, tracks
+                                  flows, decodes L7 protocols.
+  core agent       unprivileged   Owns the "tagger" and "workloadmeta"
+                                  canonical metadata stores.
+  trace agent      unprivileged   Receives APM spans, samples them,
+                                  computes RED stats.
+  process agent    unprivileged   Process and container inventory.
+  security agent   unprivileged   CWS runtime detections, CSPM.
+  DogStatsD        unprivileged   Accepts metrics over UDP/UDS/pipe.
+
+Quoting the architecture notes: "each process has a focused
+responsibility, but they share a common Go codebase, a common
+configuration, and a common forwarding path."
+
+INTER-PROCESS COMMUNICATION
+
+  system-probe exposes an HTTP API over a Unix domain socket. The
+  network endpoint is /network_tracer/connections. The unprivileged
+  core agent and security agent consume it.
+
+  The core agent serves tags and workload metadata back to the other
+  processes over gRPC sockets.
+
+  Note the direction of each: kernel data flows UP from the privileged
+  process, metadata flows DOWN from the unprivileged one. Neither
+  process needs the other's privileges.
+
+THE UNIFORM DATA PATH
+
+  collect  ->  aggregate  ->  serialize  ->  forward
+               TimeSampler    Series          HTTP POST to intake
+               CheckSampler   Sketches        with retry queues
+
+  Every signal type -- metrics, logs, traces, CWS payloads -- has its
+  own instance of this same pipeline shape.
+
+THE DETAIL THAT MATTERS MOST TO US
+
+  On Windows, Datadog does not use eBPF at all. The kernel side is a
+  Windows Filtering Platform driver. But, quoting directly:
+
+      "The user-space surface is the same -- same HTTP endpoints,
+       same encoders -- but the kernel side is a Windows Filtering
+       Platform driver."
+
+  They abstracted the kernel data source behind a stable interface.
+  Everything above that interface is unaware of which implementation
+  is underneath. This is the single most valuable idea to steal, and
+  section 8 explains why it is worth more to us than to most people.
+
+HOW THEY JOIN NETWORK DATA TO APPLICATION DATA
+
+  Unified Service Tagging: env, service and version tags applied
+  consistently across every signal. Universal Service Monitoring
+  resolves PID -> service by reading process environment variables
+  (from /proc/PID/environ on Linux, via system APIs on Windows).
+
+  This is an ENTITY-level join, not a connection-level join. Worth
+  dwelling on, because it is not what we built. See section 8, item 3.
+
+
+========================================================================
+3. HOW DYNATRACE DOES IT
+========================================================================
+
+Injection instead of instrumentation, plus an edge aggregation tier.
+
+ONEAGENT
+
+  A watchdog process plus a set of specialized processes on each host.
+  Deep-code monitoring modules are injected into each process as it
+  starts: OneAgent identifies a launched process and, if it is
+  supported and not excluded by injection rules, sets up a dynamic
+  link between that process and the matching deep-code module.
+
+  The consequence is that Dynatrace gets the equivalent of our
+  Program.cs OpenTelemetry block WITHOUT a code change, a package
+  reference or a rebuild. We edited Program.cs; they inject at
+  process start.
+
+  Other capabilities: OS and process metrics, log file discovery and
+  parsing, process-level and process-to-process network monitoring,
+  and RUM via an injected JavaScript tag.
+
+  Communication to the backend is outbound only, over HTTP/S. A
+  WebSocket session is opened to ActiveGate or the cluster when Live
+  Debugger is enabled.
+
+ACTIVEGATE
+
+  An edge tier between the agents and the backend. It collects
+  messages from OneAgent instances, builds bulks, compresses them,
+  and sends them on. It knows the runtime structure of the
+  environment and routes messages to the correct server endpoints.
+  It can also act as a configurable secure network data proxy, and
+  network zones constrain which ActiveGate a given OneAgent talks to.
+
+  In OpenTelemetry vocabulary this is precisely the gateway pattern.
+
+HOW THEY JOIN
+
+  PurePath for in-process stitching, plus the process-group entity
+  model that feeds the Smartscape topology. Again: an ENTITY-level
+  join.
+
+
+========================================================================
+4. HOW THE OPENTELEMETRY COLLECTOR DOES IT
+========================================================================
+
+The vendor-neutral version of the same shape, and the one we can
+actually adopt wholesale because our app already speaks OTLP.
+
+  receivers  ->  processors  ->  exporters
+
+  Receivers are ingress boundaries. Processors transform, batch,
+  sample and enrich. Exporters are egress boundaries. Data from all
+  receivers is pushed to the first processor, then down the chain;
+  a processor may drop data if it is sampling or filtering. The last
+  processor pushes to the exporters, and each exporter gets a copy.
+
+DEPLOYMENT PATTERNS
+
+  Agent    -- a collector on the same host as the application.
+  Gateway  -- a centralized standalone collector service receiving
+              from many agents, doing central filtering and sampling.
+
+  These are the same binary deployed differently, not two products.
+  Dynatrace's ActiveGate is the gateway pattern under another name.
+
+PROCESSOR ORDER, WHICH IS NOT OPTIONAL
+
+  memory_limiter -> resource -> attributes -> filter -> tail_sampling
+  -> batch
+
+  memory_limiter goes FIRST in every pipeline. Without it a traffic
+  spike or a backend outage causes unbounded in-memory buffering
+  until the collector is OOM-killed, losing all in-flight telemetry.
+  Set limit_mib to about 80% of the memory limit.
+
+  batch goes LAST, immediately before export, to maximize compression
+  efficiency.
+
+  Tail sampling, if used, requires every span of a trace to reach the
+  same collector instance, which means trace-aware load balancing in
+  a multi-instance deployment. It is also memory-hungry and must be
+  paired with the memory limiter. Always put an error policy first or
+  you risk sampling away the traces you actually need.
+
+
+========================================================================
+5. GAP ANALYSIS: WHAT WE HAVE TODAY
+========================================================================
+
+                     OURS TODAY                  WHAT THE GROWN-UPS DO
+  ---------------------------------------------------------------------
+  Export             AddConsoleExporter()        OTLP/HTTP with retry
+                     -> 4.8 MB app.log           queues
+
+  Kernel read        PowerShell shelling         Native API bindings,
+                     bpftool --json, decoding    typed decoders
+                     bytes by offset
+
+  Delivery           Polling only                Ring buffer push, poll
+                                                 only for gauges
+
+  Struct layout      Duplicated in 3 places:     One generated
+                     contoso_sockops.c,          definition
+                     watch.ps1,
+                     collect-logs.ps1
+
+  Backpressure       None                        memory_limiter first,
+                                                 batch last
+
+  Self-health        None                        Dropped events, queue
+                                                 depth, overrun counts
+
+  Kernel source      Hard-wired to eBPF          Swappable behind an
+                                                 interface
+
+  Output             A static .txt regenerated   Live streams
+                     by hand
+
+  Persistence        Program vanishes on reboot  Service, auto-restart
+
+The struct-layout row is the one that will bite first. The byte offsets
+of flow_stats_t are currently written out by hand in three files that
+must be edited in lockstep. Add a field to the C struct and two
+PowerShell scripts start silently misreporting.
+
+
+========================================================================
+6. TWO DEFECTS FOUND IN THE CURRENT eBPF PROGRAM
+========================================================================
+
+Both are worth fixing regardless of which architecture we choose.
+
+DEFECT 1 -- flow_map leaks and then fails silently
+
+  BPF_SOCK_OPS_CONNECTION_DELETED_CB sets stats->open = 0 but never
+  removes the entry. There is no bpf_map_delete_elem call anywhere in
+  contoso_sockops.c -- verified by grep.
+
+  Closed flows therefore accumulate until MAX_FLOWS (1024) is reached.
+  After that bpf_map_update_elem fails, and its return value is
+  ignored, so the program stops recording new flows with no error
+  anywhere.
+
+  On a machine doing real traffic this is hours, not days.
+
+  Fix: BPF_MAP_TYPE_LRU_HASH is supported by this runtime (it is
+  value 8 in ebpf_structs.h). Changing the map type is close to a
+  one-word fix. Alternatively the collector deletes entries after it
+  has exported them, which is closer to what Datadog does, but the
+  LRU is the safety net that should exist either way.
+
+DEFECT 2 -- client.port alone is not a safe join key
+
+  Ports are reused after TIME_WAIT. Over any meaningful window, a
+  bare client.port will eventually match two different connections.
+
+  The join key needs to be (remote_ip, remote_port, pid) qualified by
+  a time window -- and even then, reuse inside the window is possible
+  on a busy loopback.
+
+  This is why both Datadog and Dynatrace join at the entity level and
+  treat the connection-level detail as enrichment. See section 8.
+
+
+========================================================================
+7. PROPOSED ARCHITECTURE
+========================================================================
+
+  +-- kernel ------------------------------------------------+
+  |  contoso_sockops.o  (sockops hook)                        |
+  |                                                           |
+  |    flow_map (LRU)     stats_map      events_ringbuf  (*)  |
+  +---------------------------+-------------------------------+
+                              |
+                              |  EbpfApi.dll, direct P/Invoke.
+                              |  No bpftool, no JSON, no parsing.
+                              |
+  +---------------------------v-------------------------------+
+  |  contoso-system-probe                       PRIVILEGED    |
+  |                                                           |
+  |    IFlowSource  <--  ebpf | etw | wfp                (*)  |
+  |    ring_buffer__poll  +  periodic map scrape              |
+  |    flow state machine, PID -> process identity            |
+  |                                                           |
+  |    exposes:  \\.\pipe\contoso-probe                       |
+  +---------------------------+-------------------------------+
+                              |
+                              |  Named pipe. Windows equivalent of
+                              |  Datadog's UDS. Kernel data flows up,
+                              |  metadata flows down.
+                              |
+  +---------------------------v-------------------------------+
+  |  contoso-agent                            UNPRIVILEGED    |
+  |                                                           |
+  |    receivers:   probe pipe  +  OTLP :4317  <-- the app    |
+  |    processors:  tagger -> correlate -> batch              |
+  |    exporters:   OTLP + disk-backed retry queue            |
+  +---------------------------+-------------------------------+
+                              |
+                              v   OTLP/gRPC
+                       dashboard backend
+
+  (*) marks what does not exist yet.
+
+WHY TWO PROCESSES
+
+  It mirrors Datadog's system-probe / core-agent split. Only the probe
+  runs elevated; the component that talks to the network and handles
+  export credentials does not. See section 9 for the honest argument
+  against it at our scale.
+
+
+========================================================================
+8. THE SIX CHANGES THAT CARRY THE WEIGHT
+========================================================================
+
+1. IFlowSource ABSTRACTION
+
+   Steal Datadog's Windows lesson directly: put the kernel data source
+   behind an interface and let everything above it be ignorant of the
+   implementation.
+
+   This is worth more to us than to most people, because of what we
+   went through to get eBPF loaded at all. The shipped MSI is built
+   NativeOnly with JIT and the interpreter compiled out; loading our
+   program required swapping in the Build.Release.x64 runtime, which
+   genuinely lowers this machine's security posture by permitting
+   unsigned eBPF bytecode to be JIT-compiled and run in kernel mode.
+
+   An ETW fallback (Microsoft-Windows-TCPIP) is therefore not a
+   consolation prize. It survives reboot, needs no unsigned-bytecode
+   JIT, and gives the agent something useful to do on any machine
+   where eBPF will not load -- which, given the above, is most of them.
+
+2. PUSH, DO NOT POLL
+
+   Add a BPF_MAP_TYPE_RINGBUF to the program. Connection open and
+   close events get pushed in real time; flow_map and stats_map are
+   scraped on an interval only for current-state gauges.
+
+   The runtime supports this fully: ring_buffer__new, ring_buffer__poll,
+   ring_buffer__consume and ring_buffer__free are all exported from
+   EbpfApi.dll, and BPF_MAP_TYPE_RINGBUF is map type 13.
+
+   Note the API changed: synchronous polling via ring_buffer__poll is
+   now the default and matches Linux. The older asynchronous
+   auto-callback mode (EBPF_RINGBUF_FLAG_AUTO_CALLBACK) is deprecated.
+   Use the polling mode.
+
+   This closes the short-lived-connection blind spot: any connection
+   that opens and closes between two scrapes is currently invisible.
+
+3. A TWO-LEVEL JOIN
+
+   Today we have exactly one join, and it is the fragile one.
+
+     Entity join      service.name, service.instance.id, process.pid
+                      carried as OTel Resource attributes. Always
+                      works. Survives port reuse. This is what
+                      Datadog and Dynatrace actually rely on.
+
+     Connection join  (remote_ip, remote_port, pid) within a time
+                      window. Precise, and genuinely valuable -- it is
+                      what let us show 20 requests sharing 1 socket --
+                      but it must be the layer on top, not the
+                      foundation.
+
+4. OTel SEMANTIC CONVENTIONS, NOT BESPOKE FIELDS
+
+   Emit the eBPF layer as:
+
+     network.peer.address / network.peer.port
+     network.local.address / network.local.port
+     network.transport = tcp
+     network.connection.duration   (histogram)
+     network.connections.active    (gauge)
+
+   Then any OTLP backend understands the kernel layer natively, with
+   no custom mapping and no bespoke dashboard queries. This is the
+   difference between telemetry a tool can reason about and numbers
+   only we can read.
+
+5. ONE STRUCT DEFINITION
+
+   Replace the three hand-rolled byte-offset decoders with a single
+   [StructLayout(LayoutKind.Sequential)] record in the probe. The C
+   struct and the C# struct are then the only two places a layout
+   lives, and P/Invoke enforces the match instead of a human doing it.
+
+6. SELF-OBSERVABILITY
+
+   The agent must report on itself: ring buffer overruns, map
+   fullness, export queue depth, drop counts, last successful export.
+
+   Both commercial agents do this heavily, and defect 1 in section 6
+   is the exact argument for it -- a map that silently stops recording
+   is invisible without it.
+
+
+========================================================================
+9. OPEN QUESTIONS
+========================================================================
+
+PROCESS SPLIT -- is two processes worth it here?
+
+  It is the right design and it is what Datadog does. But this is one
+  machine running one app. The honest counter-argument: the benefit of
+  the split is least privilege, and our probe already depends on a
+  security-weakened eBPF runtime, so the threat model is muddled
+  either way. A single privileged Windows Service is meaningfully
+  simpler to build and debug.
+
+HOW MUCH TO LEAN ON ETW
+
+  If the ETW source can carry most of the load, there is a real
+  argument for making eBPF the OPTIONAL enrichment layer rather than
+  the foundation. That would let us roll back the runtime swap and
+  return the machine to the signed NativeOnly build.
+
+  Rollback, for reference:
+      cd C:\ebpf-jit-1.5.0
+      .\setup-ebpf.ps1 -Uninstall
+      msiexec /i C:\ebpf-jit-1.5.0\ROLLBACK-ebpf-for-windows.x64.1.5.0.msi
+
+BACKEND
+
+  Still undecided, and the cheapest decision to change later provided
+  the exporter endpoint and headers stay config-driven.
+
+  Leaning toward a local grafana/otel-lgtm container: Grafana,
+  Prometheus, Tempo and Loki in one image with OTLP on 4317/4318,
+  persistent storage and dashboards we can provision as code. Docker
+  is already running on this machine. An existing OTLP endpoint, if
+  there is one, trumps it.
+
+  Rejected: .NET Aspire Dashboard. Excellent trace waterfall, but
+  in-memory storage only, so no retention, no query language, no
+  custom dashboards and no alerting.
+
+SCOPE
+
+  End-to-end, or a walking skeleton first? The skeleton would be:
+  ring buffer -> probe -> OTLP -> live dashboard, for one signal
+  only, proving the whole path before filling in breadth.
+
+
+========================================================================
+10. SOURCES
+========================================================================
+
+Datadog Agent architecture
+  https://factory.ai/open-source-wikis/datadog-agent?page=overview%2Farchitecture.md
+
+Datadog system-probe
+  https://factory.ai/open-source-wikis/datadog-agent?page=apps%2Fsystem-probe.md
+
+Universal Service Monitoring setup
+  https://docs.datadoghq.com/universal_service_monitoring/setup/
+
+Datadog APM and Cloud Network Monitoring correlation
+  https://www.datadoghq.com/blog/apm-cnm-application-debugging/
+
+How OneAgent works
+  https://docs.dynatrace.com/docs/platform/oneagent/how-one-agent-works
+
+Dynatrace ActiveGate
+  https://docs.dynatrace.com/docs/ingest-from/dynatrace-activegate
+
+OpenTelemetry Collector architecture
+  https://opentelemetry.io/docs/collector/architecture/
+
+OpenTelemetry agent-to-gateway deployment pattern
+  https://opentelemetry.io/docs/collector/deploy/other/agent-to-gateway/
+
+Local, in this repo
+  ebpf/ebpf-for-windows/docs/RingBuffer.md
+  ebpf/ebpf-for-windows/include/bpf/libbpf.h
+  ebpf/ebpf-for-windows/include/ebpf_structs.h
+  ebpf/ebpf-for-windows/ebpfapi/Source.def

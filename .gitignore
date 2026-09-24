@@ -1,0 +1,27 @@
+# Build output
+bin/
+obj/
+*.user
+.vs/
+
+# The eBPF for Windows source tree, cloned here to build contoso_sockops.c against
+# its headers. It is Microsoft's repository with its own history and licence -- 1,500
+# files that are not ours and would be stale the day after they were committed.
+# ebpf/setup.ps1 clones it; ebpf/README.md says so.
+ebpf/ebpf-for-windows/
+
+# Runtime output. app.console-exporter.log reached 101 MB overnight when the OTLP
+# exporter was still writing to the console, which is the kind of thing that should
+# never be in a repository even once.
+*.log
+*.err
+
+# Collector and probe state: the DPAPI-encrypted cloud credential, the spool, and the
+# durable ids. Machine-specific, and one of them is a secret.
+state/
+*.dat
+
+# Local overrides. appsettings.json ships with every secret null on purpose; this is
+# where a real endpoint and key would go, and it must not be committed.
+appsettings.Local.json
+appsettings.*.Local.json

@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="ContosoPizza.Collector/ContosoPizza.Collector.csproj" />
+  <Project Path="ContosoPizza.Probe/ContosoPizza.Probe.csproj" />
+  <Project Path="ContosoPizza.Shared/ContosoPizza.Shared.csproj" />
+</Solution>

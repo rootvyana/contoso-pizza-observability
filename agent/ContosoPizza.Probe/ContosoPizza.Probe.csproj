@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- BpfMapInfo uses a fixed byte buffer for char name[64] so the struct
+         stays blittable for LibraryImport source-generated marshalling. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>ContosoPizza.Probe</RootNamespace>
+    <AssemblyName>ContosoPizza.Probe</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ContosoPizza.Shared\ContosoPizza.Shared.csproj" />
+  </ItemGroup>
+
+  <!-- Deliberately short. The probe reads the kernel and posts to the collector;
+       it holds no cloud credential, spools nothing to disk, and exports no
+       telemetry of its own, so it needs none of the OpenTelemetry packages the
+       collector carries. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.12" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,42 @@
+# Test harness only -- NOT the dashboard.
+#
+# A local OTLP sink that prints everything it receives, so the agent and the app
+# can be verified independently of wherever the real dashboard lives. Point both
+# producers at this, confirm the data shape, then set
+# OTEL_EXPORTER_OTLP_ENDPOINT at the real backend.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Order matters: memory_limiter first so a backend stall cannot OOM the
+  # collector, batch last so compression works on full payloads.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+  batch:
+    timeout: 1s
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]

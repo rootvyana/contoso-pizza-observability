@@ -1,0 +1,415 @@
+================================================================================
+ CONNECTING THE COLLECTOR TO ANY BACKEND
+ The server-side contract. loveheartbeat is one implementation of it.
+================================================================================
+
+ This document is for the team building the RECEIVING application. If you are
+ installing the collector against a backend that already exists, you want
+ ONBOARDING.txt instead.
+
+ Implement four HTTP endpoints and the collector will talk to you. There is no
+ SDK to take and nothing to link against.
+
+
+--------------------------------------------------------------------------------
+ 1. WHAT YOU ARE SIGNING UP FOR
+--------------------------------------------------------------------------------
+
+ Four POST endpoints under a base URL you choose:
+
+     POST  {base}/api/v1/collectors/enroll       no auth      once per collector
+     POST  {base}/api/v1/collectors/session      credential   on demand
+     POST  {base}/api/v1/collectors/heartbeat    session      every 30s
+     POST  {base}/api/v1/collectors/telemetry    session      every 5s when busy
+
+ The path suffixes are fixed in the collector (Cloud/CloudOptions.cs). The base
+ is configuration. If you cannot serve these paths, change those four
+ properties and rebuild -- it is four lines.
+
+ Everything is JSON in, JSON out, over HTTPS. The collector never listens for
+ you: all four are outbound calls it makes.
+
+ THE MINIMUM THAT WORKS is /session and /telemetry. Skip enrollment by handing
+ the collector a credential out of band (section 6). Heartbeat can return a
+ bare 200 and an empty object. Start there, add the rest when you want them.
+
+
+--------------------------------------------------------------------------------
+ 2. THE AUTHENTICATION MODEL
+--------------------------------------------------------------------------------
+
+ Three tiers. You must implement the shape; the storage is yours.
+
+   ENROLLMENT TOKEN    Single use, short lived. A human copies it from your UI
+                       into the collector once. Spend it on first exchange.
+
+   CREDENTIAL          NEVER EXPIRES. Issued at enrollment, stored encrypted on
+                       the collector's own disk. This is the only thing a
+                       collector needs to recover on its own, forever. Do not
+                       put a clock on it -- a collector installed inside a
+                       customer's network by somebody who will not log in again
+                       for a year turns an expiring credential into a silent
+                       telemetry outage on a random Tuesday. End it with an
+                       explicit revoke instead.
+
+   SESSION             Short lived, presented on every request. Slide its
+                       expiry forward on each use, so an active collector never
+                       reaches it. When one is refused the collector mints a
+                       new one from the credential and retries -- so no human
+                       is ever paged for authentication.
+
+ Store neither secret in a form that can be replayed. Key them by a SHA-256 of
+ the token; the collector holds the only copy of the raw value.
+
+ Revocation should take effect on the collector's NEXT request, not whenever
+ its session happens to lapse. That means re-reading the collector's status on
+ every authenticated call, not trusting the session alone.
+
+
+--------------------------------------------------------------------------------
+ 3. THE FOUR ENDPOINTS
+--------------------------------------------------------------------------------
+
+ 3a. POST /api/v1/collectors/enroll
+ -----------------------------------
+ No authentication. The token in the body is the authentication.
+
+ REQUEST
+     {
+       "token":    "<one-time enrollment token>",
+       "hostname": "GW-01",
+       "version":  "0.2.0"
+     }
+
+ RESPONSE 200
+     {
+       "collector_id":               "col_abc123",
+       "collector_credential":       "ccred_...",     <- must not expire
+       "session_token":              "csess_...",
+       "session_expires_at":         "2026-09-22T06:00:00Z",
+       "renew_after_seconds":        21600,
+       "heartbeat_interval_seconds": 30,
+       "config":        { "scrape_interval_ms": 2000,
+                          "batch_size": 200,
+                          "collection_enabled": true },
+       "config_version": 1
+     }
+
+ 400 for an invalid, spent or expired token. The collector retries on its own
+ schedule and says clearly in its log that it is waiting for a valid token.
+
+ The collector persists the credential BEFORE using it. Do not expect a second
+ chance to deliver it: the enrollment token is already spent by then, and a
+ credential that exists on your side and nowhere else needs a human to fix.
+
+
+ 3b. POST /api/v1/collectors/session
+ ------------------------------------
+ HEADER   X-Collector-Credential: ccred_...
+
+ REQUEST
+     { "collector_id": "col_abc123" }
+
+ RESPONSE 200
+     Same as enroll, minus collector_credential.
+
+ 401 means the credential is not valid. The collector treats this as terminal
+ and says so -- it is the one state it cannot recover from alone, so only
+ answer 401 here when you mean "this collector is revoked".
+
+
+ 3c. POST /api/v1/collectors/heartbeat
+ --------------------------------------
+ HEADER   X-Collector-Session: csess_...
+
+ REQUEST
+     {
+       "hostname": "GW-01",
+       "version":  "0.2.0",
+       "servers":  ["web-01", "web-02", "db-01"],
+       "health":   { "uptime_seconds": 3600,
+                     "cloud_authenticated": true,
+                     "flows_received": 1204,
+                     "spans_received": 8891,
+                     "records_delivered": 10095,
+                     "delivery_failures": 0,
+                     "spool_segments_pending": 0,
+                     "spool_bytes": 0,
+                     "segments_dropped": 0,
+                     "otlp_metrics_dropped": 4210,
+                     "last_successful_delivery": "...",
+                     "last_delivery_error": null,
+                     "collection_enabled": true,
+                     "scrape_interval_ms": 2000 }
+     }
+
+ RESPONSE 200
+     {
+       "session_expires_at":         "...",
+       "heartbeat_interval_seconds": 30,
+       "config":        { "scrape_interval_ms": 5000,
+                          "batch_size": 200,
+                          "collection_enabled": true },
+       "config_version": 2
+     }
+
+ This is your control channel. Whatever you put in `config` is applied by the
+ collector and handed down to its probes in the reply to their next POST -- so
+ one change in your UI retunes an entire fleet without anybody logging into a
+ machine. Bump config_version when you change something.
+
+ You also decide the cadence: heartbeat_interval_seconds is obeyed, so you can
+ slow every collector down without shipping a new build.
+
+ `health` is what makes a fleet view possible. An agent-per-server design can
+ only tell you about agents that are alive; this tells you about the one that
+ stopped, because the collector reports on behalf of its servers.
+
+ A WebSocket would be the obvious shape for this and is deliberately not used:
+ a backend on Lambda, or behind any request/response gateway, cannot hold one.
+ Polling on an interval the server chooses gets the same two things across.
+
+
+ 3d. POST /api/v1/collectors/telemetry
+ --------------------------------------
+ HEADER   X-Collector-Session: csess_...
+
+ REQUEST
+     {
+       "logs":  [ ... ],
+       "spans": [ ... ],
+       "flows": [ ... ]
+     }
+
+ At most 200 records total per request (the collector clamps its batch size to
+ that). Any 2xx is success. The response body is ignored.
+
+ THE ONE RULE THAT MATTERS: the collector deletes its spooled copy the moment
+ you answer 2xx. Write the batch through to durable storage BEFORE answering.
+ Anything you acknowledge and then lose is lost for good.
+
+
+--------------------------------------------------------------------------------
+ 4. THE RECORD SHAPES
+--------------------------------------------------------------------------------
+
+ SPAN -- one handled request, from an application's OpenTelemetry exporter.
+
+     {
+       "span_id":        "00f067aa0ba902b7",
+       "trace_id":       "4bf92f3577b34da6a3ce929d0e0e4736",
+       "parent_span_id": null,
+       "name":           "GET /api/v1/orders",
+       "kind":           "SERVER",
+       "start_time":     "2026-09-21T18:24:42.015Z",
+       "duration_ms":    12.5,
+       "status":         "OK",
+       "server":         "web-01",
+       "attributes":     { "http.route": "/api/v1/orders",
+                           "http.request.method": "GET",
+                           "http.response.status_code": 200,
+                           "service.name": "orders-api",
+                           "host.name": "web-01",
+                           "collector.id": "col_abc123" }
+     }
+
+   kind     INTERNAL | SERVER | CLIENT | PRODUCER | CONSUMER
+   status   OK | ERROR | UNSET
+   Group your route views on attributes["http.route"]. It is a template, not a
+   concrete path, which is what makes grouping meaningful.
+
+ LOG -- an application log record, or an eBPF network flow.
+
+     {
+       "timestamp":  "2026-09-21T18:24:42.015Z",
+       "level":      "WARN",
+       "message":    "Pizza oven running hot",
+       "trace_id":   "...",            // null if not correlated
+       "span_id":    "...",
+       "source":     "otel",           // "otel" or "ebpf"
+       "server":     "web-01",
+       "attributes": { ... }
+     }
+
+ FLOW -- one TCP connection seen by the kernel. Only if probes are deployed.
+
+     {
+       "id":           "9f2c...",      // stable; safe to overwrite on retry
+       "timestamp":    "2026-09-21T18:24:42.015Z",
+       "server":       "web-01",
+       "direction":    "inbound",      // inbound | outbound
+       "local_addr":   "10.0.0.5",  "local_port":  5432,
+       "remote_addr":  "10.0.0.9",  "remote_port": 54999,
+       "state":        "closed",
+       "duration_ms":  31.0,
+       "process_id":   6464,
+       "process_name": "postgres",
+       "client_port":  54999           // null on outbound rows
+     }
+
+   client_port is the join key back into the application's spans, which carry
+   client.port. It is only meaningful inbound: on an outbound row the remote
+   port is the server's and joins nothing.
+
+ A SUGGESTION, NOT A REQUIREMENT: keep flows out of whatever stream your route
+ views read. They have no http.route, so they cannot be grouped there and will
+ just add rows that are not API traffic.
+
+
+--------------------------------------------------------------------------------
+ 5. STATUS CODES -- THE COLLECTOR'S RETRY CONTRACT
+--------------------------------------------------------------------------------
+
+ This is the part to get right. The collector's behaviour is fully determined
+ by your status code, and the wrong one either loses data or wedges the queue
+ forever.
+
+   2xx              Accepted. The spooled copy is DELETED. Be durable first.
+
+   401              Session refused. The collector renews from its credential
+                    and retries the same batch once. Costs a round trip, loses
+                    nothing. Use this and only this for an expired session.
+
+   408, 429, 5xx    Retryable. Spooled, exponential backoff, retried forever.
+                    Use these for anything transient, including "my database
+                    is down". Nothing is lost.
+
+   other 4xx        Permanent. LOGGED LOUDLY AND DISCARDED. This is deliberate:
+                    a batch you will never accept must not block every batch
+                    behind it. Only answer 4xx when a retry genuinely cannot
+                    succeed -- a malformed body, a batch over the limit.
+
+ Delivery is AT-LEAST-ONCE. A crash between your write and the collector seeing
+ your 2xx costs a duplicate, never a loss. Every flow carries a stable `id` and
+ spans carry `span_id`: key on them and a redelivery overwrites its own row
+ instead of double-counting.
+
+
+--------------------------------------------------------------------------------
+ 6. SKIPPING ENROLLMENT
+--------------------------------------------------------------------------------
+
+ For a backend that provisions collectors out of band, or for a first
+ integration where you do not want to build the enrollment UI yet:
+
+     $env:Cloud__CollectorId         = "col_whatever"
+     $env:Cloud__CollectorCredential = "some-secret-you-issued"
+
+ The collector stores them and goes straight to /session. You then only need
+ /session and /telemetry to have a working pipeline.
+
+
+--------------------------------------------------------------------------------
+ 7. OPTIONAL: A ROUTER IN FRONT
+--------------------------------------------------------------------------------
+
+ If one hostname fronts several backends and picks between them by a token,
+ set it and the collector adds it to the body of every request:
+
+     $env:CONTOSO_COLLECTOR_ENV_TOKEN = "..."
+
+ It arrives as a top-level "env" field. Leave it unset and nothing is added.
+ Your models should ignore unknown fields either way.
+
+
+--------------------------------------------------------------------------------
+ 8. THE SMALLEST RECEIVER THAT WORKS
+--------------------------------------------------------------------------------
+
+ Enough to accept real telemetry. Python, no dependencies beyond FastAPI.
+
+     from fastapi import FastAPI, Header, HTTPException
+     import uuid
+
+     app = FastAPI()
+     CREDENTIALS = {}          # credential -> collector_id
+     SESSIONS    = {}          # session    -> collector_id
+     TOKENS      = {"paste-this-into-the-collector": "col_demo"}
+
+     def _session_reply(collector_id):
+         session = "csess_" + uuid.uuid4().hex
+         SESSIONS[session] = collector_id
+         return {"collector_id": collector_id,
+                 "session_token": session,
+                 "renew_after_seconds": 3600,
+                 "heartbeat_interval_seconds": 30,
+                 "config": {"scrape_interval_ms": 2000,
+                            "batch_size": 200,
+                            "collection_enabled": True},
+                 "config_version": 1}
+
+     @app.post("/api/v1/collectors/enroll")
+     def enroll(body: dict):
+         collector_id = TOKENS.pop(body.get("token"), None)   # single use
+         if not collector_id:
+             raise HTTPException(400, "Invalid or already-used enrollment token")
+         credential = "ccred_" + uuid.uuid4().hex
+         CREDENTIALS[credential] = collector_id
+         return {**_session_reply(collector_id),
+                 "collector_credential": credential}          # never expires
+
+     @app.post("/api/v1/collectors/session")
+     def session(body: dict, x_collector_credential: str = Header(None)):
+         collector_id = CREDENTIALS.get(x_collector_credential)
+         if not collector_id:
+             raise HTTPException(401, "Invalid collector credential")
+         return _session_reply(collector_id)
+
+     def _auth(session):
+         collector_id = SESSIONS.get(session or "")
+         if not collector_id:
+             raise HTTPException(401, "Collector session is required")
+         return collector_id
+
+     @app.post("/api/v1/collectors/heartbeat")
+     def heartbeat(body: dict, x_collector_session: str = Header(None)):
+         _auth(x_collector_session)
+         return {"heartbeat_interval_seconds": 30, "config_version": 1}
+
+     @app.post("/api/v1/collectors/telemetry")
+     def telemetry(body: dict, x_collector_session: str = Header(None)):
+         _auth(x_collector_session)
+         # WRITE THROUGH TO DURABLE STORAGE HERE, BEFORE RETURNING.
+         # Returning 200 tells the collector to delete its only copy.
+         for span in body.get("spans", []):
+             print("span ", span["name"], span.get("duration_ms"), "ms")
+         for log in body.get("logs", []):
+             print("log  ", log.get("source"), log.get("message"))
+         return {"accepted": len(body.get("spans", [])) + len(body.get("logs", []))}
+
+ Run it, then:
+
+     $env:Cloud__Endpoint                    = "http://localhost:9000"
+     $env:CONTOSO_COLLECTOR_ENROLLMENT_TOKEN = "paste-this-into-the-collector"
+     $env:CONTOSO_PROBE_KEY                  = "anything"
+     dotnet run
+
+ Point an application's OTEL_EXPORTER_OTLP_ENDPOINT at the collector and its
+ spans will print in that terminal.
+
+ This receiver is a demo, not a design: everything is in memory, sessions never
+ expire, and nothing is durable. Sections 2 and 5 say what to fix before it is
+ anything else.
+
+
+--------------------------------------------------------------------------------
+ 9. WHAT YOU DO NOT HAVE TO BUILD
+--------------------------------------------------------------------------------
+
+ The collector already owns, and you inherit for free:
+
+   - Disk spooling with a size quota, so a backend outage loses nothing and a
+     long one cannot fill the customer's disk.
+   - Exponential backoff and forever-retry.
+   - Session renewal, and recovery from a refused session without a human.
+   - Credential encryption at rest (DPAPI, machine-scoped).
+   - An OTLP receiver speaking both protobuf and JSON, so any OpenTelemetry
+     SDK or collector can point at it unmodified.
+   - Fan-in from many servers behind one credential.
+   - A connectivity diagnostic (--diagnose) for the "can this machine even
+     reach you" question, which is the failure that actually happens.
+
+ What you own: the four endpoints, durable storage, and deciding what the data
+ means.
+
+================================================================================
