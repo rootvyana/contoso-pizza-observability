@@ -1,7 +1,7 @@
 # ELEVATED. Replaces the NativeOnly MSI runtime with the JIT-capable build.
 # Reverse with:  cd C:\ebpf-jit-1.5.0; .\setup-ebpf.ps1 -Uninstall
 #                msiexec /i C:\ebpf-jit-1.5.0\ROLLBACK-ebpf-for-windows.x64.1.5.0.msi
-$log = 'C:\Users\artha\Desktop\ContosoPizza\ebpf\swap-runtime.log'
+$log = Join-Path $PSScriptRoot 'swap-runtime.log'
 Start-Transcript -Path $log -Force | Out-Null
 $ErrorActionPreference = 'Continue'
 
@@ -47,7 +47,7 @@ foreach ($p in 'C:\Windows\System32\drivers\EbpfCore.sys', 'C:\Windows\System32\
 }
 
 Write-Host "`n=== 6. THE TEST: load in JIT mode ==="
-$obj = 'C:\Users\artha\Desktop\ContosoPizza\ebpf\contoso_sockops.o'
+$obj = Join-Path $PSScriptRoot 'contoso_sockops.o'
 $netsh = 'netsh'
 & $netsh ebpf add program $obj execution=jit
 Write-Host "exit code: $LASTEXITCODE"

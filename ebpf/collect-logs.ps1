@@ -1,6 +1,8 @@
 # ELEVATED. Drives traffic, then collects BOTH instrumentation layers into one report.
 $ErrorActionPreference = 'Continue'
-$root   = 'C:\Users\artha\Desktop\ContosoPizza'
+# Derived from the script's own location, so a clone works anywhere rather
+# than only on the machine this was written on.
+$root   = Split-Path $PSScriptRoot -Parent
 $ebpf   = "$root\ebpf"
 $report = "$ebpf\instrumentation-report.txt"
 $applog = "$root\app.log"

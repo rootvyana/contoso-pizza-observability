@@ -1,9 +1,9 @@
 # ELEVATED. Unloads the old program, loads the corrected one, re-runs the test.
-$log = 'C:\Users\artha\Desktop\ContosoPizza\ebpf\reload-and-verify.log'
+$log = Join-Path $PSScriptRoot 'reload-and-verify.log'
 Start-Transcript -Path $log -Force | Out-Null
 $ErrorActionPreference = 'Continue'
 $bpftool = 'C:\Program Files\ebpf-for-windows\bpftool.exe'
-$root = 'C:\Users\artha\Desktop\ContosoPizza\ebpf'
+$root = $PSScriptRoot
 
 Write-Host "=== unload existing ==="
 $existing = (netsh ebpf show programs) | Select-String -Pattern 'contoso_connection_monitor'

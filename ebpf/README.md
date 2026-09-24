@@ -191,7 +191,7 @@ App stdout/stderr are captured at `..\app.log` and `..\app.err`.
 run is blocked by the permission classifier. Run it yourself from an
 **administrator** PowerShell:
 
-    C:\Users\artha\Desktop\ContosoPizza\ebpf\swap-runtime.ps1
+    <repo>\ebpf\swap-runtime.ps1
 
 It uninstalls the MSI, installs the JIT build, and immediately attempts the JIT
 load, logging everything to `swap-runtime.log`.

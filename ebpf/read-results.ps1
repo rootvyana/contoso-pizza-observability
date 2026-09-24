@@ -1,5 +1,5 @@
 # ELEVATED. The program is already loaded; this drives traffic and reads the maps.
-$log = 'C:\Users\artha\Desktop\ContosoPizza\ebpf\read-results.log'
+$log = Join-Path $PSScriptRoot 'read-results.log'
 Start-Transcript -Path $log -Force | Out-Null
 $ErrorActionPreference = 'Continue'
 $bpftool = 'C:\Program Files\ebpf-for-windows\bpftool.exe'
@@ -8,7 +8,7 @@ Write-Host "=== loaded programs ==="
 netsh ebpf show programs
 
 Write-Host "`n=== driving 12 requests over 127.0.0.1 ==="
-& 'C:\Users\artha\Desktop\ContosoPizza\ebpf\generate-traffic.ps1' -Requests 12
+& (Join-Path $PSScriptRoot 'generate-traffic.ps1') -Requests 12
 Start-Sleep -Seconds 2
 
 Write-Host "`n=== raw flow_map ==="
@@ -17,7 +17,7 @@ Write-Host "`n=== raw stats_map ==="
 & $bpftool map dump name stats_map
 
 Write-Host "`n=== decoded ==="
-& 'C:\Users\artha\Desktop\ContosoPizza\ebpf\watch.ps1'
+& (Join-Path $PSScriptRoot 'watch.ps1')
 
 Write-Host "`n=== VERDICT ==="
 $dump = (& $bpftool --json map dump name flow_map 2>&1 | Out-String)

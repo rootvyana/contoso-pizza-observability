@@ -25,3 +25,8 @@ state/
 # where a real endpoint and key would go, and it must not be committed.
 appsettings.Local.json
 appsettings.*.Local.json
+
+# Compiled eBPF object. build.ps1 regenerates it, and clang embeds the absolute build
+# path in the binary -- which on a public repo publishes whoever's home directory it
+# was built in.
+ebpf/*.o
