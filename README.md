@@ -7,6 +7,11 @@ It exists to answer one question end to end: **how does telemetry get from a mac
 inside somebody's network to an observability backend outside it, without opening a
 port, and arrive joined up rather than as three unrelated piles of data?**
 
+**[ARCHITECTURE.md](ARCHITECTURE.md)** is the full design: the three processes, the
+joins, the auth model, and an honest reckoning against
+[the original proposal](observability-architecture.txt) — including the two things it
+called essential that were not built, and why.
+
 Everything here has been run. The numbers in [Verified](#verified) are from a real
 collector talking to a real deployment, not a design document.
 
@@ -196,6 +201,8 @@ A monitoring stack is only worth anything on the bad path, so the app ships thre
 ## Layout
 
 ```
+ARCHITECTURE.md                 how it is built, and where it departs from the proposal
+observability-architecture.txt  the original research and proposal, 17 Sep 2026
 Program.cs, Controllers/        the sample app and its OpenTelemetry setup
 ebpf/                           contoso_sockops.c and the load/build scripts
 agent/

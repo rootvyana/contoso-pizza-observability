@@ -3,6 +3,16 @@ collector agent design -- research, gap analysis and proposal
 written 2026-09-17
 ========================================================================
 
+  HISTORICAL. This is the proposal, written before any of it was built.
+  It is kept because the research in sections 2-4 and the two defects in
+  section 6 are still the reasoning behind the design.
+
+  For what was actually built -- and for the places this document was
+  wrong, including the process split in section 7 and the ring buffer in
+  section 8 -- see ARCHITECTURE.md.
+
+========================================================================
+
 CONTENTS
 
   1. The problem
