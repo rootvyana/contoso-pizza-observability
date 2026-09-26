@@ -23,15 +23,45 @@ The two layers join on **client port**: `flow_map`'s key carries `remote_port`, 
 
 ## Order of operations
 
+### 0. The runtime — do this first
+
+`setup.ps1` installs the *toolchain*, not the eBPF runtime. The runtime is a
+prerequisite and is not installed by anything in this repository.
+
+Install **eBPF for Windows v1.5.0** from
+<https://github.com/microsoft/ebpf-for-windows/releases>, and note which build:
+
+| | Loads an unsigned `.o`? |
+|---|---|
+| `ebpf-for-windows.x64.1.5.0.msi` | **no** — JIT and interpreter are compiled out |
+| `Build.Release.x64.zip` (349 MB) | yes |
+
+The MSI is the right choice for a machine that will run *signed native* programs. To
+load `contoso_sockops.o` directly you need the second, and `swap-runtime.ps1` performs
+that replacement — read the trade-off in
+[ARCHITECTURE.md](../ARCHITECTURE.md#7-reading-the-kernel) before running it, because it
+permits unsigned bytecode to be JIT-compiled into kernel mode.
+
+Check what you have:
+
+    netsh ebpf show programs          # runtime responding at all
+    Get-Service eBPFCore, NetEbpfExt  # both should be Running
+
+### 1. Toolchain and build
+
 Non-elevated, from this folder:
 
     .\setup.ps1                 # winget LLVM (~2.5 GB) + clone repo for headers
     .\build.ps1                 # clang -target bpf -> contoso_sockops.o
     .\add-otel-packages.ps1     # pins real NuGet versions, then dotnet build
 
+### 2. Load
+
 Elevated:
 
     .\load.ps1                  # netsh ebpf add program ... execution=jit
+
+`add program` is not persistent. The program is gone after a reboot; re-run `load.ps1`.
 
 Non-elevated, in a second window — start the app, then:
 

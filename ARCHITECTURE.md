@@ -18,7 +18,7 @@ ones. [Against the proposal](#against-the-proposal) reconciles the two line by l
 4. [Authentication](#4-authentication)
 5. [Durability](#5-durability)
 6. [The joins](#6-the-joins)
-7. [Reading the kernel](#7-reading-the-kernel)
+7. [Reading the kernel](#7-reading-the-kernel) — which eBPF, and how it is installed
 8. [Receiving OpenTelemetry](#8-receiving-opentelemetry)
 9. [The cloud contract](#9-the-cloud-contract)
 10. [Self-observability](#10-self-observability)
@@ -221,6 +221,101 @@ service did not answer"*.
 ---
 
 ## 7. Reading the kernel
+
+### Which eBPF
+
+**[eBPF for Windows](https://github.com/microsoft/ebpf-for-windows) v1.5.0** — Microsoft's
+reimplementation, not the Linux kernel's. They share a bytecode format, `clang -target
+bpf`, and most of the libbpf API. They do not share hooks.
+
+This matters more than it sounds:
+
+> **There is no uprobe, kprobe or tracepoint.** The program types registered by this
+> runtime are `bind`, `cgroup/{bind,connect,listen,recv_accept}{4,6}`,
+> `cgroup/connect_authorization{4,6}` and `sockops` — all network hooks.
+
+Nothing can attach to a CLR function. That is the whole reason there are two
+instrumentation layers rather than one: HTTP routes, status codes and exception detail
+are simply not reachable from the kernel on Windows, so they have to come from inside
+the process. The eBPF layer contributes what the process cannot see — that a connection
+existed, how long the socket was open, and which process owned it.
+
+`contoso_sockops.c` attaches to `sockops` and handles three callbacks:
+`BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB` (outbound), `BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB`
+(inbound accept — the one that matters for a server) and
+`BPF_SOCK_OPS_CONNECTION_DELETED_CB`.
+
+### How the runtime gets installed, and the trade it forces
+
+This is the least portable part of the system, and the part most likely to stop someone
+reproducing it.
+
+**The toolchain** is straightforward: `setup.ps1` installs LLVM for `clang` (~2.5 GB)
+and shallow-clones the eBPF for Windows repository for its headers. `build.ps1` then
+runs `clang -target bpf -O2 -g -Werror` to produce `contoso_sockops.o`. Neither step
+needs elevation, and the clone is headers only — the binaries come from the runtime.
+
+**The runtime is the problem.** v1.5.0 ships in two forms, and only one of them can run
+this program:
+
+| Distribution | Built from | JIT | Interpreter |
+|---|---|---|---|
+| `ebpf-for-windows.x64.1.5.0.msi` | `NativeOnlyRelease` | compiled **out** | compiled **out** |
+| `Build.Release.x64.zip` (349 MB) | `Release` | **yes** | yes |
+
+With the MSI installed, loading an unsigned `.o` fails in every mode:
+
+```
+netsh ebpf add program contoso_sockops.o execution=jit        → error 129
+netsh ebpf add program contoso_sockops.o execution=interpret  → error 129
+netsh ebpf add program contoso_sockops.o execution=native     → Element not found
+```
+
+Error 129 is not an eBPF result code — `libs/ebpfnetsh/programs.cpp` prints C `errno`,
+and **129 is `ENOTSUP` in MSVC**. JIT and the interpreter are compile-time features of
+`ebpfcore.sys`, gated on `CONFIG_BPF_JIT_DISABLED` and `CONFIG_BPF_INTERPRETER_DISABLED`,
+and the published MSI is built by the CI job that sets both. No MSI feature selection
+can turn them back on; the `JIT\ebpfsvc.exe` folder it installs is a misleading
+leftover. (There is a second gate, `jit_permitted = !hypervisor_code_integrity_enabled`
+— HVCI was off here, so it was not a factor.)
+
+The verifier is not the obstacle. The program passes it cleanly:
+
+```
+netsh ebpf show verification file=contoso_sockops.o type=sockops
+→ Verification succeeded. Program terminates within 0 loop iterations
+```
+
+**What was done:** `swap-runtime.ps1` uninstalls the MSI and installs
+`Build.Release.x64.zip` over it. Same version, same program-type GUIDs, same API — only
+the compile-time feature flags differ.
+
+**What that costs.** The JIT-capable build will take unsigned eBPF bytecode and
+JIT-compile it into kernel mode. That is a genuine reduction in the machine's security
+posture, and it is why `IFlowSource` exists: an ETW implementation
+(`Microsoft-Windows-TCPIP`) would need none of it, survives reboots, and would let this
+machine go back to the signed build. It is the first thing to write if the kernel layer
+is taken further.
+
+Rollback, kept deliberately simple:
+
+```powershell
+cd C:\ebpf-jit-1.5.0
+.\setup-ebpf.ps1 -Uninstall
+msiexec /i C:\ebpf-jit-1.5.0\ROLLBACK-ebpf-for-windows.x64.1.5.0.msi
+```
+
+**The production answer is native mode**, which needs none of this: `bpf2c.exe` compiles
+the bytecode to C, which is built and signed into a real `.sys` driver that the stock
+MSI runtime will load. It was not taken here because it needs a kernel build toolchain
+— Visual Studio and the WDK, both absent on this machine — and because a driver has to
+be signed or the machine left in test-signing mode. For anything shipped to a customer
+that is the path, not the runtime swap.
+
+**The program does not survive a reboot.** `netsh ebpf add program` is not persistent.
+Re-run `load.ps1`, or install it as a startup task.
+
+### Talking to it
 
 `EbpfApi.dll` by direct P/Invoke — no `bpftool`, no JSON, no parsing. Seven exports:
 
